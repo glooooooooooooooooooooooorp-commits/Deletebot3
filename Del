@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Telegram bot: триггеры + удаление сообщений через 5 секунд.
-
+Изменения:
+  - При совпадении: удаляем сообщение и удаляем соответствующий триггер из persist-файла.
+  - Ответ на /start отправляется, но сам ответ удаляется через DELETE_DELAY секунд.
 Требования:
     pip install python-telegram-bot==20.5
 
@@ -14,9 +16,9 @@ import os
 import json
 import asyncio
 import re
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 
-from telegram import Update, ChatMember
+from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
 # Файл для хранения триггеров (persist)
@@ -65,11 +67,9 @@ async def is_user_admin(update: Update, user_id: int) -> bool:
     if update.effective_chat is None:
         return False
     chat = update.effective_chat
-    # Получаем список админов
     try:
         admins = await chat.get_administrators()
     except Exception:
-        # В некоторых случаях может быть ошибка (например, приватный чат)
         admins = []
     return any(ad.user.id == user_id for ad in admins)
 
@@ -83,35 +83,53 @@ def extract_tokens(text: str) -> Set[str]:
     """
     if not text:
         return set()
-    # Заменим разделители на пробелы, затем split
     cleaned = _TOKEN_RE.sub(" ", text)
     tokens = {t.lower() for t in cleaned.split() if t}
     return tokens
 
-def message_matches_triggers(text: str, triggers: List[str]) -> bool:
+def normalize_phrase(text: str) -> str:
+    """Нормализуем фразу: оставляем токены через пробел в нижнем регистре."""
+    return " ".join(sorted(extract_tokens(text))) if False else " ".join(extract_tokens(text))
+
+def find_matching_trigger(text: str, triggers: List[str]) -> Optional[str]:
     """
-    true если любой триггер присутствует как отдельный токен в тексте.
-    Триггеры сравниваются игнорируя регистр.
+    Возвращает первый триггер (оригинальная строка из triggers), который совпал с текстом.
+    Совпадение:
+      - если триггер содержит пробел — проверяем вхождение нормализованной фразы в нормализованный текст;
+      - иначе — проверяем отдельный токен.
     """
     if not text or not triggers:
-        return False
+        return None
     tokens = extract_tokens(text)
-    triggers_lower = {t.lower() for t in triggers}
-    # Если триггер содержит пробел (фраза), проверяем вхождение фразы целиком (без разбиения)
-    for trig in triggers_lower:
-        if " " in trig:
-            # фраза: проверяем как отдельное слово или просто substring? Здесь проверим простое вхождение с нормализацией пробелов
-            norm_text = " ".join(extract_tokens(text))
-            norm_trig = " ".join(extract_tokens(trig))
+    norm_text = " ".join(extract_tokens(text))
+    # пройдемся по триггерам в их оригинальном виде (чтобы вернуть именно эту строку для удаления)
+    for trig in triggers:
+        trig_lower = trig.lower()
+        if " " in trig_lower:
+            norm_trig = " ".join(extract_tokens(trig_lower))
             if norm_trig and norm_trig in norm_text:
-                return True
+                return trig  # возвращаем оригинальный триггер
         else:
-            if trig in tokens:
-                return True
-    return False
+            if trig_lower in tokens:
+                return trig
+    return None
 
 # ----------------- Обработчики команд -----------------
-
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляем приветствие, но удаляем собственный ответ через DELETE_DELAY секунд."""
+    if update.effective_message is None:
+        return
+    sent = await update.message.reply_text(
+        "Привет! Я бот, который удаляет сообщения, содержащие триггерные слова через 5 секунд."
+    )
+    # планируем удаление ответа бота
+    async def delayed_delete_bot_reply():
+        await asyncio.sleep(DELETE_DELAY)
+        try:
+            await context.bot.delete_message(chat_id=sent.chat_id, message_id=sent.message_id)
+        except Exception:
+            pass
+    asyncio.create_task(delayed_delete_bot_reply())
 
 async def add_trigger_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat is None or update.effective_message is None:
@@ -161,7 +179,9 @@ async def list_triggers_command(update: Update, context: ContextTypes.DEFAULT_TY
 # ----------------- Обработчик сообщений -----------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    При каждом сообщении проверяем триггеры для чата. Если есть совпадение — удаляем сообщение через DELETE_DELAY секунд.
+    При каждом сообщении проверяем триггеры для чата.
+    Если есть совпадение — удаляем сообщение через DELETE_DELAY секунд
+    и удаляем этот триггер из persist (чтобы он больше не срабатывал).
     """
     if update.effective_chat is None or update.message is None:
         return
@@ -172,21 +192,32 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not triggers:
         return
 
-    if message_matches_triggers(text, triggers):
+    matched = find_matching_trigger(text, triggers)
+    if matched:
         msg = update.message
-        # создаём задачу удаления через DELETE_DELAY секунд
+
+        # Удаляем триггер из хранилища (если он там есть)
+        removed = remove_chat_trigger(chat_id, matched)
+
+        # Создаём задачу удаления сообщения через DELETE_DELAY секунд
         async def delayed_delete():
             await asyncio.sleep(DELETE_DELAY)
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
-            except Exception as e:
+            except Exception:
                 # обычно тут будет exception, если у бота нет прав или сообщение уже удалено
-                # можно логировать, но для простоты — молча пропускаем
-                # print("delete error:", e)
                 pass
 
         # Запускаем задачу (не ждём её завершения)
         asyncio.create_task(delayed_delete())
+
+        # (опционально) можно уведомить админа/чат о том, что триггер удалён — но по умолчанию молчим.
+        # Если нужно уведомление, можно раскомментировать:
+        # if removed:
+        #     try:
+        #         await context.bot.send_message(chat_id=chat_id, text=f"Триггер `{matched}` был удалён после срабатывания.", parse_mode="Markdown")
+        #     except Exception:
+        #         pass
 
 # ----------------- Основной запуск -----------------
 def main():
