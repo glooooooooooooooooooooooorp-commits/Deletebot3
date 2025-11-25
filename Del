@@ -410,6 +410,8 @@ def main():
 
     print("Бот запущен...")
     app.run_polling()
-
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /start больше ничего не делает."""
+    pass  # бот ничего не отправляет
 if __name__ == "__main__":
     main()
