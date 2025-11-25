@@ -195,7 +195,7 @@ def main():
 
     app = ApplicationBuilder().token(token).build()
 
-    app.add_handler(CommandHandler("start", start_command))
+
     app.add_handler(CommandHandler("add_trigger", add_trigger_command))
     app.add_handler(CommandHandler("remove_trigger", remove_trigger_command))
     app.add_handler(CommandHandler("list_triggers", list_triggers_command))
