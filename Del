@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+Telegram bot: триггеры + удаление сообщений через 5 секунд.
+
+Требования:
+    pip install python-telegram-bot==20.5
+
+Запуск:
+    export BOT_TOKEN="ВАШ_TELEGRAM_BOT_TOKEN"
+    python delete_trigger_bot.py
+"""
+
+import os
+import json
+import asyncio
+import re
+from typing import Dict, List, Set
+
+from telegram import Update, ChatMember
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+
+# Файл для хранения триггеров (persist)
+TRIGGERS_FILE = "triggers.json"
+DELETE_DELAY = 5  # секунд до удаления
+
+# ----------------- Утилиты для хранения -----------------
+def load_triggers() -> Dict[str, List[str]]:
+    """Загрузить триггеры из файла. Ключи — str(chat_id), значения — список триггеров (строки)."""
+    if not os.path.exists(TRIGGERS_FILE):
+        return {}
+    with open(TRIGGERS_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except Exception:
+            return {}
+
+def save_triggers(triggers: Dict[str, List[str]]) -> None:
+    with open(TRIGGERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(triggers, f, ensure_ascii=False, indent=2)
+
+def get_chat_triggers(chat_id: int) -> List[str]:
+    triggers = load_triggers()
+    return triggers.get(str(chat_id), [])
+
+def add_chat_trigger(chat_id: int, trigger: str) -> None:
+    triggers = load_triggers()
+    lst = triggers.setdefault(str(chat_id), [])
+    if trigger not in lst:
+        lst.append(trigger)
+        save_triggers(triggers)
+
+def remove_chat_trigger(chat_id: int, trigger: str) -> bool:
+    triggers = load_triggers()
+    lst = triggers.get(str(chat_id), [])
+    if trigger in lst:
+        lst.remove(trigger)
+        triggers[str(chat_id)] = lst
+        save_triggers(triggers)
+        return True
+    return False
+
+# ----------------- Проверка админа -----------------
+async def is_user_admin(update: Update, user_id: int) -> bool:
+    """Проверяет, является ли пользователь админом в данном чате."""
+    if update.effective_chat is None:
+        return False
+    chat = update.effective_chat
+    # Получаем список админов
+    try:
+        admins = await chat.get_administrators()
+    except Exception:
+        # В некоторых случаях может быть ошибка (например, приватный чат)
+        admins = []
+    return any(ad.user.id == user_id for ad in admins)
+
+# ----------------- Токенизация/сравнение -----------------
+_TOKEN_RE = re.compile(r"[^\w/]+", flags=re.UNICODE)  # разбиваем по не-словам кроме '/' (чтобы сохранить команды вида /vaip)
+
+def extract_tokens(text: str) -> Set[str]:
+    """
+    Разбить текст на токены; оставить такие токены как '/vaip', 'hello', 'word123'.
+    Возвращает множество токенов в нижнем регистре.
+    """
+    if not text:
+        return set()
+    # Заменим разделители на пробелы, затем split
+    cleaned = _TOKEN_RE.sub(" ", text)
+    tokens = {t.lower() for t in cleaned.split() if t}
+    return tokens
+
+def message_matches_triggers(text: str, triggers: List[str]) -> bool:
+    """
+    true если любой триггер присутствует как отдельный токен в тексте.
+    Триггеры сравниваются игнорируя регистр.
+    """
+    if not text or not triggers:
+        return False
+    tokens = extract_tokens(text)
+    triggers_lower = {t.lower() for t in triggers}
+    # Если триггер содержит пробел (фраза), проверяем вхождение фразы целиком (без разбиения)
+    for trig in triggers_lower:
+        if " " in trig:
+            # фраза: проверяем как отдельное слово или просто substring? Здесь проверим простое вхождение с нормализацией пробелов
+            norm_text = " ".join(extract_tokens(text))
+            norm_trig = " ".join(extract_tokens(trig))
+            if norm_trig and norm_trig in norm_text:
+                return True
+        else:
+            if trig in tokens:
+                return True
+    return False
+
+# ----------------- Обработчики команд -----------------
+
+
+async def add_trigger_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or update.effective_message is None:
+        return
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not await is_user_admin(update, user.id):
+        await update.message.reply_text("Только администраторы могут добавлять триггеры.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /add_trigger <триггер>. Пример: /add_trigger /vaip")
+        return
+    trigger = " ".join(args).strip()
+    add_chat_trigger(chat_id, trigger)
+    await update.message.reply_text(f"Триггер добавлен: `{trigger}`", parse_mode="Markdown")
+
+async def remove_trigger_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None or update.effective_message is None:
+        return
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not await is_user_admin(update, user.id):
+        await update.message.reply_text("Только администраторы могут удалять триггеры.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Использование: /remove_trigger <триггер>")
+        return
+    trigger = " ".join(args).strip()
+    ok = remove_chat_trigger(chat_id, trigger)
+    if ok:
+        await update.message.reply_text(f"Триггер удалён: `{trigger}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Триггер не найден.")
+
+async def list_triggers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat is None:
+        return
+    chat_id = update.effective_chat.id
+    lst = get_chat_triggers(chat_id)
+    if not lst:
+        await update.message.reply_text("Триггеров для этого чата нет.")
+    else:
+        await update.message.reply_text("Триггеры для этого чата:\n" + "\n".join(f"- `{t}`" for t in lst), parse_mode="Markdown")
+
+# ----------------- Обработчик сообщений -----------------
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    При каждом сообщении проверяем триггеры для чата. Если есть совпадение — удаляем сообщение через DELETE_DELAY секунд.
+    """
+    if update.effective_chat is None or update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    text = update.message.text or update.message.caption or ""
+    triggers = get_chat_triggers(chat_id)
+    if not triggers:
+        return
+
+    if message_matches_triggers(text, triggers):
+        msg = update.message
+        # создаём задачу удаления через DELETE_DELAY секунд
+        async def delayed_delete():
+            await asyncio.sleep(DELETE_DELAY)
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+            except Exception as e:
+                # обычно тут будет exception, если у бота нет прав или сообщение уже удалено
+                # можно логировать, но для простоты — молча пропускаем
+                # print("delete error:", e)
+                pass
+
+        # Запускаем задачу (не ждём её завершения)
+        asyncio.create_task(delayed_delete())
+
+# ----------------- Основной запуск -----------------
+def main():
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        print("Ошибка: установите переменную окружения BOT_TOKEN с токеном бота.")
+        return
+
+    app = ApplicationBuilder().token(token).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("add_trigger", add_trigger_command))
+    app.add_handler(CommandHandler("remove_trigger", remove_trigger_command))
+    app.add_handler(CommandHandler("list_triggers", list_triggers_command))
+
+    # Обработчик всех текстовых сообщений
+    app.add_handler(MessageHandler(filters.TEXT | filters.Caption, message_handler))
+
+    print("Бот запущен...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
